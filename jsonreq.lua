@@ -1,6 +1,6 @@
 local _M = {
 	_VERSION	 = 'json-request 0.0.2',
-	_DESCRIPTION = 'JSON-Request : handles general JSON HTTP/anything request with headers and optional request function.',
+	_DESCRIPTION = 'JSON-Request (jsonreq) : handles general JSON HTTP/anything request with headers and JSONRPC functions.',
 	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2024 - MIT Cheese Please',
 }
 
@@ -38,7 +38,6 @@ local request_handler_http = function(self, payload, headers, resource, method)
 	
 	if verbose then
 		print(rtbl.method .. " -> " .. url)
-		--printTable(headers or {})
 		print(payload)
 	end
 	
