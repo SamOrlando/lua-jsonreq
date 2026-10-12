@@ -22,19 +22,35 @@ _M.json = load_json()
 
 _M.verbose = false -- when true, prints method/url and payload (may expose secrets)
 
+local function is_https(url) return lower(url:sub(1, 8)) == "https://" end
+
+_M.TIMEOUT = 30 -- default request timeout in seconds (client opt.timeout / per-call override)
+
 -- Transports are loaded lazily so plain-HTTP users do not need luasec.
-local http_request, https_request, ltn12
-local function get_transport(https)
-	ltn12 = ltn12 or require("ltn12")
+local http_mod, https_mod, ltn12
+local function get_module(https)
 	if https then
-		https_request = https_request or require("ssl.https").request
-		return https_request
+		https_mod = https_mod or require("ssl.https")
+		return https_mod
 	end
-	http_request = http_request or require("socket.http").request
-	return http_request
+	http_mod = http_mod or require("socket.http")
+	return http_mod
 end
 
-local function is_https(url) return lower(url:sub(1, 8)) == "https://" end
+-- Default transport: luasocket/luasec request with rtbl.timeout applied.
+-- Both modules read their TIMEOUT field per connection (luasec forbids a
+-- custom 'create'), so it is set for the duration of this blocking call.
+local function default_transport(rtbl)
+	local mod = get_module(is_https(rtbl.url))
+	local old = mod.TIMEOUT
+	mod.TIMEOUT = rtbl.timeout or _M.TIMEOUT
+	local ok, res, code, h = pcall(mod.request, rtbl)
+	mod.TIMEOUT = old
+	if not ok then return nil, tostring(res) end
+	return res, code, h
+end
+_M.default_transport = default_transport
+
 
 local function copy(t, into)
 	into = into or {}
@@ -65,9 +81,9 @@ _M.meta.__index = mm
 -- Returns: decoded_body, status_code, response_headers, raw_body
 -- On transport failure: nil, error_message
 -- On non-JSON body: nil, status_code, response_headers, raw_body, decode_error
-local function request_handler_http(self, payload, headers, resource, method)
+local function request_handler_http(self, payload, headers, resource, method, timeout)
 	local url = (self.url or "") .. (resource or "")
-	local transport = self.transport or get_transport(is_https(url))
+	local transport = self.transport or default_transport
 	ltn12 = ltn12 or require("ltn12")
 	local response_body = {}
 	local rtbl = {
@@ -76,6 +92,7 @@ local function request_handler_http(self, payload, headers, resource, method)
 		headers = headers,
 		source = (payload and payload ~= "") and ltn12.source.string(payload) or nil,
 		sink = ltn12.sink.table(response_body),
+		timeout = timeout or self.timeout or _M.TIMEOUT,
 	}
 	if _M.verbose then
 		print(rtbl.method .. " -> " .. url)
@@ -103,6 +120,7 @@ _M.new = function(opt)
 		url = opt.url,             -- base url/uri
 		headers = copy(opt.headers), -- injected headers on calls (for auth, etc)
 		request_handler = opt.request_handler or request_handler_http,
+		timeout = opt.timeout,     -- seconds; nil -> jsonreq.TIMEOUT (30)
 		transport = opt.transport, -- optional function(rtbl) -> res, code, headers (luasocket style)
 		next_id = 0,
 	}
@@ -151,15 +169,15 @@ function mm:rpc_string(method, params, id)
 	return safe_encode(self:rpc_table(method, params, id))
 end
 
-function mm:rpc(method, params, id, headers, resource)
+function mm:rpc(method, params, id, headers, resource, timeout)
 	if not self.enabled then return nil, "disabled" end
 	local payload, err = self:rpc_string(method, params, id)
 	if not payload then return nil, err end
 	local h = build_headers(self, headers, "application/json", #payload)
-	return self.request_handler(self, payload, h, resource or "", "POST")
+	return self.request_handler(self, payload, h, resource or "", "POST", timeout)
 end
 
-function mm:call(payload, headers, resource, method)
+function mm:call(payload, headers, resource, method, timeout)
 	if not self.enabled then return nil, "disabled" end
 	if type(payload) == "table" then
 		payload = copy(self.root, copy(payload))
@@ -171,14 +189,14 @@ function mm:call(payload, headers, resource, method)
 	end
 	payload = payload or ""
 	local h = build_headers(self, headers, "application/json", #payload)
-	return self.request_handler(self, payload, h, resource or "", method or "POST")
+	return self.request_handler(self, payload, h, resource or "", method or "POST", timeout)
 end
 
-function mm:get(resource, headers) return self:call(nil, headers, resource, "GET") end
-function mm:post(resource, payload, headers) return self:call(payload, headers, resource, "POST") end
-function mm:put(resource, payload, headers) return self:call(payload, headers, resource, "PUT") end
-function mm:patch(resource, payload, headers) return self:call(payload, headers, resource, "PATCH") end
-function mm:update(resource, payload, headers) return self:call(payload, headers, resource, "UPDATE") end -- legacy, non-standard verb
-function mm:delete(resource, headers) return self:call(nil, headers, resource, "DELETE") end
+function mm:get(resource, headers, timeout) return self:call(nil, headers, resource, "GET", timeout) end
+function mm:post(resource, payload, headers, timeout) return self:call(payload, headers, resource, "POST", timeout) end
+function mm:put(resource, payload, headers, timeout) return self:call(payload, headers, resource, "PUT", timeout) end
+function mm:patch(resource, payload, headers, timeout) return self:call(payload, headers, resource, "PATCH", timeout) end
+mm.update = mm.patch -- legacy name; UPDATE is not an HTTP method, sends PATCH (RFC 5789)
+function mm:delete(resource, headers, timeout) return self:call(nil, headers, resource, "DELETE", timeout) end
 
 return _M

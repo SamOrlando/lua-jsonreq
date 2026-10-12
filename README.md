@@ -29,7 +29,12 @@ api:post("/items", { name = "x" })
 api:put("/items/1", { name = "y" })
 api:patch("/items/1", { name = "z" })
 api:delete("/items/1")
+api:update("/items/1", { name = "z" })        -- alias of patch(): sends PATCH
+api:get("/slow", nil, 120)                    -- per-call timeout (seconds)
 ```
+
+`update()` is kept for backward compatibility but is an alias of `patch()`:
+`UPDATE` is not an HTTP method, `PATCH` is (RFC 5789).
 
 ### Options for `jsonreq.new(opt)` (or a URL string)
 
@@ -39,9 +44,19 @@ api:delete("/items/1")
 | `headers` | headers added to every request (per-call headers override) |
 | `params` | params merged into every JSON-RPC `params` |
 | `root` | fields merged into every JSON-RPC envelope / table payload |
+| `timeout` | request timeout in seconds (default `jsonreq.TIMEOUT` = 30), applied to both HTTP and HTTPS |
 | `enabled` | `false` makes every call return `nil, "disabled"` |
 | `transport` | luasocket-style `request(t)` function (for tests, proxies, timeouts) |
 | `request_handler` | full replacement `function(self, payload, headers, resource, method)` |
+
+### Timeouts
+
+Precedence: per-call argument > client `opt.timeout` > `jsonreq.TIMEOUT` (30 s).
+Per-call: last argument of `get(resource, headers, timeout)`, `delete(...)`,
+`post/put/patch(resource, payload, headers, timeout)`, `call(payload, headers, resource, method, timeout)`
+and `rpc(method, params, id, headers, resource, timeout)`. A timeout is returned as `nil, "timeout"`
+(HTTPS handshake timeouts may report e.g. `"wantread"`), never thrown. Custom `transport`
+functions receive the value as `t.timeout`.
 
 ### Return values
 

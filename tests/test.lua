@@ -75,7 +75,7 @@ test("REST verbs and resource", function()
 	end
 	for _, v in ipairs({ "post", "put", "patch", "update" }) do
 		local p = { x = 1 }
-		c[v](c, "/r", p); eq(last.req.method, v:upper()); eq(json.decode(last.body).x, 1)
+		c[v](c, "/r", p); eq(last.req.method, v == "update" and "PATCH" or v:upper()); eq(json.decode(last.body).x, 1)
 	end
 end)
 
@@ -109,6 +109,51 @@ test("encode error returned, not thrown", function()
 	local c = jr.new({ url = "http://h", transport = (fake(200, '{}')) })
 	local r, e = c:post("", { f = function() end }); eq(r, nil); assert(e:find("encode"))
 end)
+
+test("timeout: default, client, per-call", function()
+	local t, last = fake(200, '{}')
+	local c = jr.new({ url = "http://h", transport = t })
+	c:get("/"); eq(last.req.timeout, 30); eq(jr.TIMEOUT, 30)
+	c.timeout = 5; c:get("/"); eq(last.req.timeout, 5)
+	c:get("/", nil, 1.5); eq(last.req.timeout, 1.5)
+	c:post("/", {}, nil, 2); eq(last.req.timeout, 2)
+	c:rpc("m", nil, nil, nil, nil, 3); eq(last.req.timeout, 3)
+	eq(jr.new({ timeout = 7, url = "http://h", transport = t }):get("/") and last.req.timeout, 7)
+end)
+
+-- real slow server (needs luasocket); skipped if unavailable
+local ok_sock, socket = pcall(require, "socket")
+if ok_sock and jr.default_transport then
+	test("real timeout returned, not thrown", function()
+		local srv = assert(socket.bind("127.0.0.1", 0))
+		local _, port = srv:getsockname()
+		local c = jr.new({ url = "http://127.0.0.1:" .. port, timeout = 0.3 })
+		local t0 = socket.gettime()
+		local r, e = c:get("/") -- server accepts in backlog but never answers
+		local dt = socket.gettime() - t0
+		srv:close()
+		eq(r, nil); assert(tostring(e):find("timeout"), "err: " .. tostring(e))
+		assert(dt < 2, "took " .. dt)
+		eq(require("socket.http").TIMEOUT, 60, "module TIMEOUT restored")
+	end)
+	if pcall(require, "ssl.https") then
+		test("real https timeout returned, not thrown", function()
+			local srv = assert(socket.bind("127.0.0.1", 0))
+			local _, port = srv:getsockname()
+			local t0 = socket.gettime()
+			local r, e = jr.new({ url = "https://127.0.0.1:" .. port, timeout = 0.3 }):get("/")
+			local dt = socket.gettime() - t0
+			srv:close()
+			eq(r, nil); assert(e); assert(dt < 2, "took " .. dt)
+			eq(require("ssl.https").TIMEOUT, 60, "module TIMEOUT restored")
+		end)
+	end
+	test("real connection refused returned", function()
+		local srv = assert(socket.bind("127.0.0.1", 0)); local _, port = srv:getsockname(); srv:close()
+		local r, e = jr.new({ url = "http://127.0.0.1:" .. port, timeout = 1 }):get("/")
+		eq(r, nil); assert(e)
+	end)
+end
 
 test("no globals leaked", function()
 	for _, k in ipairs({ "mm", "verbose", "encode", "decode", "random_string", "json" }) do eq(rawget(_G, k), nil, k) end
