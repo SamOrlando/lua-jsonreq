@@ -144,7 +144,7 @@ if ok_sock and jr.default_transport then
 			local r, e = jr.new({ url = "https://127.0.0.1:" .. port, timeout = 0.3 }):get("/")
 			local dt = socket.gettime() - t0
 			srv:close()
-			eq(r, nil); assert(e); assert(dt < 2, "took " .. dt)
+			eq(r, nil); eq(e, "timeout"); assert(dt < 2, "took " .. dt)
 			eq(require("ssl.https").TIMEOUT, 60, "module TIMEOUT restored")
 		end)
 	end

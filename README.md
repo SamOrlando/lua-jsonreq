@@ -55,7 +55,7 @@ Precedence: per-call argument > client `opt.timeout` > `jsonreq.TIMEOUT` (30 s).
 Per-call: last argument of `get(resource, headers, timeout)`, `delete(...)`,
 `post/put/patch(resource, payload, headers, timeout)`, `call(payload, headers, resource, method, timeout)`
 and `rpc(method, params, id, headers, resource, timeout)`. A timeout is returned as `nil, "timeout"`
-(HTTPS handshake timeouts may report e.g. `"wantread"`), never thrown. Custom `transport`
+for both HTTP and HTTPS (luasec's `"wantread"`/`"wantwrite"` are normalized), never thrown. Custom `transport`
 functions receive the value as `t.timeout`.
 
 ### Return values
@@ -66,6 +66,12 @@ functions receive the value as `t.timeout`.
 * encode error / disabled: `nil, error_message`
 
 Errors are returned, never thrown. JSON-RPC errors are in `body.error`.
+
+### HTTPS certificates
+
+HTTPS uses luasec's default client config, which is `verify = "none"`: certificates are
+**not** verified (this is why self-signed devices such as Hue bridges work, but it offers
+no protection against MITM). Behaviour is unchanged from 0.0.2.
 
 Module settings: `jsonreq.verbose = true` prints method, URL and payload (may expose secrets);
 `jsonreq.json` can be replaced with any table exposing `encode`/`decode`.

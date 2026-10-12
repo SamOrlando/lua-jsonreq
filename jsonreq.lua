@@ -47,6 +47,8 @@ local function default_transport(rtbl)
 	local ok, res, code, h = pcall(mod.request, rtbl)
 	mod.TIMEOUT = old
 	if not ok then return nil, tostring(res) end
+	-- luasec reports TLS-level timeouts as "wantread"/"wantwrite"
+	if not res and (code == "wantread" or code == "wantwrite") then code = "timeout" end
 	return res, code, h
 end
 _M.default_transport = default_transport
