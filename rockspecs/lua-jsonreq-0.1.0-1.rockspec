@@ -2,13 +2,13 @@ rockspec_format = "3.0"
 package = "lua-jsonreq"
 version = "0.1.0-1"
 source = {
-   url = "git+https://git.nodex.net:9002/odi/lua-jsonreq.git",
+   url = "git+https://github.com/SamOrlando/lua-jsonreq.git",
    tag = "v0.1.0",
 }
 description = {
    summary = "JSON over HTTP(S) and JSON-RPC 2.0 client helpers",
    detailed = "Small client for JSON REST endpoints and JSON-RPC 2.0 servers with injected headers, params and root fields, and a method proxy.",
-   homepage = "https://git.nodex.net:9002/odi/lua-jsonreq",
+   homepage = "https://github.com/SamOrlando/lua-jsonreq",
    license = "MIT",
 }
 dependencies = {
