@@ -61,10 +61,23 @@ test("rpc does not mutate caller params; injects params/root", function()
 end)
 
 test("proxy works both ways", function()
-	local t, last = fake(200, '{"result":"pong"}')
+	local last = {}
+	local function t(r)
+		last.req = r
+		local buf = {}
+		if r.source then
+			while true do local c = r.source(); if not c then break end; buf[#buf + 1] = c end
+		end
+		last.body = table.concat(buf)
+		local req = json.decode(last.body)
+		r.sink(json.encode({ jsonrpc = "2.0", result = "pong", id = req.id }))
+		r.sink(nil)
+		return 1, 200, { ["x-test"] = "1" }
+	end
 	local c = jr.new({ url = "http://h", transport = t })
 	eq(c.proxy.ping(1).result, "pong"); eq(json.decode(last.body).method, "ping")
 	eq(c:proxy().echo().result, "pong"); eq(json.decode(last.body).method, "echo")
+	eq(c:proxy():ping(4, 1).result, "pong"); eq(json.decode(last.body).params[1], 4)
 end)
 
 test("REST verbs and resource", function()
@@ -154,6 +167,123 @@ if ok_sock and jr.default_transport then
 		eq(r, nil); assert(e)
 	end)
 end
+
+test("positional params stay an array; named injection does not apply", function()
+	local t, last = fake(200, '{"jsonrpc":"2.0","result":true,"id":1}')
+	local c = jr.new({ url = "http://h", transport = t, params = { token = "k" } })
+	local p = { 10, 20 }
+	local res, err = c:rpc("sum", p)
+	eq(res, nil); assert(tostring(err):find("positional"), err)
+	eq(p.token, nil); eq(p[1], 10); eq(last.req, nil)
+	c.params = {}
+	local res2 = c:rpc("sum", { 10, 20 })
+	eq(res2.result, true)
+	local sent = json.decode(last.body)
+	eq(sent.params[1], 10); eq(sent.params[2], 20); eq(sent.params.token, nil)
+end)
+
+test("empty array params and omitted empty table", function()
+	local raw = jr.new("http://h"):rpc_string("m", json.empty_array, 1)
+	assert(raw:find('"params":[]', 1, true), raw)
+	local omitted = json.decode(jr.new("http://h"):rpc_string("m", {}, 1))
+	eq(omitted.params, nil); eq(omitted.id, 1)
+end)
+
+test("notification omits id and accepts an empty body", function()
+	local t, last = fake(204, nil)
+	local c = jr.new({ url = "http://h", transport = t })
+	c:rpc("a")
+	local res, code, _, _, err = c:notify("update", { 1, 2, 3 })
+	eq(res, nil); eq(code, 204); eq(err, nil)
+	local sent = json.decode(last.body)
+	eq(sent.id, nil); eq(sent.method, "update"); eq(sent.params[3], 3); eq(sent.jsonrpc, "2.0")
+	c:rpc("b", nil, false)
+	eq(json.decode(last.body).id, nil)
+	c:rpc("c")
+	eq(json.decode(last.body).id, 2)
+end)
+
+test("root cannot replace protocol members", function()
+	local t, last = fake(200, '{"jsonrpc":"2.0","result":true,"id":1}')
+	local c = jr.new({ url = "http://h", transport = t, root = { trace = "abc" } })
+	eq(json.decode(select(1, c:rpc_string("ping", { a = 1 }, 1))).trace, "abc")
+	c.root.jsonrpc = "1.0"
+	local res, err = c:rpc("ping")
+	eq(res, nil); assert(tostring(err):find("jsonrpc"), err); eq(last.req, nil)
+end)
+
+test("rejects bad method, params, and id without sending", function()
+	local t, last = fake(200, '{}')
+	local c = jr.new({ url = "http://h", transport = t })
+	local r, e = c:rpc(1, { "bar" }); eq(r, nil); assert(tostring(e):find("method"), e)
+	r, e = c:rpc("m", "bar"); eq(r, nil); assert(tostring(e):find("params"), e)
+	r, e = c:rpc("m", { 1 }, 1.5); eq(r, nil); assert(tostring(e):find("integer"), e)
+	eq(last.req, nil)
+	eq(json.decode(c:rpc_string("m", { 1 }, 0)).id, 0)
+	eq(json.decode(c:rpc_string("m", { 1 }, json.null)).id, json.null)
+end)
+
+test("response must match the request", function()
+	local c = jr.new({ url = "http://h", transport = fake(200, '{"jsonrpc":"2.0","result":1,"id":99}') })
+	local res, code, _, _, err = c:rpc("m", { 1 }, 1)
+	eq(res, nil); eq(code, 200); assert(tostring(err):find("does not match"), err)
+
+	c.transport = fake(200, '{"jsonrpc":"2.0","result":1,"error":{"code":-32603,"message":"x"},"id":1}')
+	res, code, _, _, err = c:rpc("m", { 1 }, 1)
+	eq(res, nil); assert(tostring(err):find("both"), err)
+
+	c.transport = fake(200, '{"result":1,"id":1}')
+	res, _, _, _, err = c:rpc("m", { 1 }, 1)
+	eq(res, nil); assert(tostring(err):find("2.0"), err)
+
+	c.transport = fake(200, '[{"jsonrpc":"2.0","result":1,"id":1}]')
+	res, _, _, _, err = c:rpc("m", { 1 }, 1)
+	eq(res, nil); assert(tostring(err):find("object"), err)
+
+	c.transport = fake(204, nil)
+	res, code, _, _, err = c:rpc("m", { 1 }, 1)
+	eq(res, nil); eq(code, 204); assert(tostring(err):find("empty response"), err)
+end)
+
+test("valid error object is returned; null placeholders are accepted", function()
+	local c = jr.new({ url = "http://h" })
+	c.transport = fake(200, '{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found","data":"no"},"id":"1"}')
+	local res = c:rpc("missing", {}, "1")
+	eq(res.error.code, -32601); eq(res.error.message, "Method not found"); eq(res.error.data, "no"); eq(res.result, nil)
+
+	c.transport = fake(200, '{"jsonrpc":"2.0","result":7,"error":null,"id":1}')
+	res = c:rpc("m", { 1 }, 1)
+	eq(res.result, 7)
+
+	c.transport = fake(200, '{"jsonrpc":"2.0","result":null,"error":{"code":-32601,"message":"nope"},"id":1}')
+	res = c:rpc("m", { 1 }, 1)
+	eq(res.error.code, -32601); eq(res.result, json.null)
+
+	c.transport = fake(200, '{"jsonrpc":"2.0","result":false,"id":3}')
+	res = c:rpc("m", { 1 }, 3)
+	eq(res.result, false)
+end)
+
+test("proxy sends nil as null", function()
+	local last = {}
+	local function t(r)
+		local buf = {}
+		if r.source then
+			while true do local ch = r.source(); if not ch then break end; buf[#buf + 1] = ch end
+		end
+		last.body = table.concat(buf)
+		local req = json.decode(last.body)
+		local result = req.params
+		if result == nil then result = false end
+		r.sink(json.encode({ jsonrpc = "2.0", result = result, id = req.id }))
+		r.sink(nil)
+		return 1, 200, {}
+	end
+	local c = jr.new({ url = "http://h", transport = t })
+	local res = c.proxy.sum(nil, 5)
+	eq(res.result[1], json.null); eq(res.result[2], 5)
+	assert(last.body:find("%[null,5%]") or last.body:find("%[null, 5%]"), last.body)
+end)
 
 test("no globals leaked", function()
 	for _, k in ipairs({ "mm", "verbose", "encode", "decode", "random_string", "json" }) do eq(rawget(_G, k), nil, k) end
