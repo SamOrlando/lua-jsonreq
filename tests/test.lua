@@ -92,15 +92,19 @@ test("REST verbs and resource", function()
 	end
 end)
 
-test("call does not mutate payload; per-call header overrides", function()
+test("call does not mutate payload; json content-type wins", function()
 	local t, last = fake(200, '{}')
-	local c = jr.new({ url = "http://h", transport = t, root = { r = 1 }, headers = { A = "inst" } })
+	local c = jr.new({ url = "http://h", transport = t, root = { r = 1 }, headers = { A = "inst", ["content-type"] = "text/plain" } })
 	local p = { x = 1 }
-	local h = { A = "call", ["Content-Type"] = "text/plain" }
+	local h = { A = "call", ["Content-Type"] = "text/csv" }
 	c:post("", p, h)
-	eq(p.r, nil); eq(h["content-length"], nil)
-	eq(last.req.headers.A, "call"); eq(last.req.headers["content-type"], nil)
-	eq(last.req.headers["Content-Type"], "text/plain")
+	eq(p.r, nil)
+	eq(h["content-length"], nil); eq(h["Content-Type"], "text/csv"); eq(h.A, "call")
+	eq(c.headers["content-type"], "text/plain")
+	eq(last.req.headers.A, "call")
+	eq(last.req.headers["content-type"], "application/json")
+	eq(last.req.headers["Content-Type"], nil)
+	eq(last.req.headers["content-length"], tostring(#last.body))
 end)
 
 test("empty body, bad json, transport failure", function()
@@ -126,7 +130,7 @@ end)
 test("timeout: default, client, per-call", function()
 	local t, last = fake(200, '{}')
 	local c = jr.new({ url = "http://h", transport = t })
-	c:get("/"); eq(last.req.timeout, 30); eq(jr.TIMEOUT, 30)
+	c:get("/"); eq(last.req.timeout, 15); eq(jr.TIMEOUT, 15)
 	c.timeout = 5; c:get("/"); eq(last.req.timeout, 5)
 	c:get("/", nil, 1.5); eq(last.req.timeout, 1.5)
 	c:post("/", {}, nil, 2); eq(last.req.timeout, 2)
@@ -210,6 +214,7 @@ test("root cannot replace protocol members", function()
 	c.root.jsonrpc = "1.0"
 	local res, err = c:rpc("ping")
 	eq(res, nil); assert(tostring(err):find("jsonrpc"), err); eq(last.req, nil)
+	eq(c.next_id, 0)
 end)
 
 test("rejects bad method, params, and id without sending", function()
@@ -283,6 +288,128 @@ test("proxy sends nil as null", function()
 	local res = c.proxy.sum(nil, 5)
 	eq(res.result[1], json.null); eq(res.result[2], 5)
 	assert(last.body:find("%[null,5%]") or last.body:find("%[null, 5%]"), last.body)
+end)
+
+test("response_table is a result object", function()
+	local c = jr.new("http://h")
+	local before = c.next_id
+	local t = c:response_table(19, 1)
+	eq(t.jsonrpc, "2.0"); eq(t.result, 19); eq(t.id, 1); eq(t.error, nil); eq(c.next_id, before)
+	eq(c:response_table(false, 0).result, false)
+	eq(c:response_table(nil, nil).result, json.null)
+	eq(c:response_table(nil, nil).id, json.null)
+	local raw = c:response_string({ ok = true }, "9")
+	local dec = json.decode(raw)
+	eq(dec.result.ok, true); eq(dec.id, "9"); eq(dec.error, nil)
+	local r, e = c:response_table(1, 1.5); eq(r, nil); assert(tostring(e):find("integer"), e)
+	c.root = { trace = "abc" }
+	eq(c:response_table(1, 1).trace, "abc")
+	c.root.result = 5
+	r, e = c:response_table(1, 1); eq(r, nil); assert(tostring(e):find("result"), e)
+end)
+
+test("response posts the result and does not require a json-rpc reply", function()
+	local t, last = fake(204, nil)
+	local c = jr.new({ url = "http://h/rpc", transport = t, headers = { A = "1" } })
+	local res, code = c:response(19, 4, { A = "call" }, "/cb")
+	eq(res, nil); eq(code, 204)
+	local sent = json.decode(last.body)
+	eq(sent.result, 19); eq(sent.id, 4); eq(sent.jsonrpc, "2.0"); eq(sent.error, nil)
+	eq(last.req.method, "POST"); eq(last.req.url, "http://h/rpc/cb")
+	eq(last.req.headers.A, "call")
+	c.enabled = false
+	local r, e = c:response(1, 1); eq(r, nil); eq(e, "disabled")
+end)
+
+test("error_table is an error response", function()
+	local c = jr.new("http://h")
+	local t = c:error_table(-32601, "Method not found", "1", { name = "nope" })
+	eq(t.jsonrpc, "2.0"); eq(t.result, nil); eq(t.id, "1")
+	eq(t.error.code, -32601); eq(t.error.message, "Method not found"); eq(t.error.data.name, "nope")
+	local bare = c:error_table(-32700, "Parse error", nil)
+	eq(bare.error.data, nil); eq(bare.id, json.null)
+	local raw = c:error_string(-32600, "Invalid Request", 3)
+	local dec = json.decode(raw)
+	eq(dec.error.code, -32600); eq(dec.id, 3); eq(dec.result, nil); eq(dec.error.data, nil)
+	local r, e = c:error_table(1.5, "x", 1); eq(r, nil); assert(tostring(e):find("code"), e)
+	r, e = c:error_table(-32603, nil, 1); eq(r, nil); assert(tostring(e):find("message"), e)
+	r, e = c:error_table(-32603, "x", false); eq(r, nil); assert(tostring(e):find("id"), e)
+end)
+
+test("response and error sending", function()
+	local calls = 0
+	local last = {}
+	local function t(r)
+		calls = calls + 1
+		last.req = r
+		local buf = {}
+		if r.source then
+			while true do local ch = r.source(); if not ch then break end; buf[#buf + 1] = ch end
+		end
+		last.body = table.concat(buf)
+		if last.fail then return nil, last.fail end
+		if last.reply then r.sink(last.reply); r.sink(nil) end
+		return 1, last.status or 200, {}
+	end
+	local c = jr.new({ url = "http://h", transport = t, timeout = 9 })
+	local res, err = c:response(function() end, 1)
+	eq(res, nil); assert(tostring(err):find("encode"), err); eq(calls, 0)
+
+	last.fail = "connection refused"
+	res, err = c:response(1, 1)
+	eq(res, nil); eq(err, "connection refused"); eq(calls, 1)
+	last.fail = nil
+
+	last.status = 204
+	c:response(1, 2, nil, nil, 4)
+	eq(last.req.timeout, 4)
+	c:error(-1, "m", 1)
+	eq(last.req.timeout, 9)
+
+	local h = { A = "x" }
+	c:error(-32601, "no", 1, nil, h)
+	eq(h["content-type"], nil); eq(h["content-length"], nil); eq(h.A, "x")
+	local sent = json.decode(last.body)
+	eq(sent.error.data, nil); assert(not last.body:find('"data"', 1, true), last.body)
+
+	local with_null = json.decode(c:error_string(-1, "m", 1, json.null))
+	eq(with_null.error.data, json.null)
+
+	c.root = { trace = "t", error = { code = 1, message = "x" } }
+	res, err = c:error_table(-32601, "nope", 5)
+	eq(res, nil); assert(tostring(err):find("error"), err)
+	c.root = {}
+
+	c.enabled = false
+	res, err = c:error(-1, "m", 1)
+	eq(res, nil); eq(err, "disabled"); eq(calls, 4)
+
+	local peer = jr.new("http://h")
+	local payload = peer:response_string({ n = 2 }, 7)
+	local epayload = peer:error_string(-32601, "Method not found", "abc")
+	local srv = jr.new({
+		url = "http://h",
+		transport = function(r)
+			local body = r.url:find("err", 1, true) and epayload or payload
+			if r.sink then r.sink(body); r.sink(nil) end
+			return 1, 200, {}
+		end,
+	})
+	local body, code = srv:request("echo", { 1 }, 7)
+	eq(code, 200); eq(body.result.n, 2); eq(body.id, 7)
+	body, code = srv:request("echo", {}, "abc", nil, "err")
+	eq(code, 200); eq(body.error.code, -32601); eq(body.result, nil); eq(body.error.data, nil)
+end)
+
+test("error posts the error object", function()
+	local t, last = fake(200, '{"ok":true}')
+	local c = jr.new({ url = "http://h", transport = t })
+	local res, code = c:error(-32602, "Invalid params", 8, { expected = "array" })
+	eq(code, 200); eq(res.ok, true)
+	local sent = json.decode(last.body)
+	eq(sent.error.code, -32602); eq(sent.error.message, "Invalid params")
+	eq(sent.error.data.expected, "array"); eq(sent.id, 8); eq(sent.result, nil)
+	eq(last.req.headers["content-type"], "application/json")
 end)
 
 test("no globals leaked", function()

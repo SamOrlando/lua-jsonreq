@@ -1,13 +1,14 @@
 --- jsonreq: JSON over HTTP(S) requests and JSON-RPC 2.0 client helpers.
 -- Works on Lua 5.1, 5.2, 5.3, 5.4 and LuaJIT.
 local _M = {
-	_VERSION     = 'json-request 0.1.1',
+	_VERSION     = 'json-request 0.2.1',
 	_DESCRIPTION = 'JSON-Request (jsonreq) : handles general JSON HTTP/anything request with headers and JSONRPC functions.',
-	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2024 - MIT Cheese Please',
+	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2026',
+	verbose = false -- when true, prints method/url and payload (may expose secrets)
 }
 
-local type, pairs, next, tostring, pcall, require, setmetatable, rawget, print =
-	type, pairs, next, tostring, pcall, require, setmetatable, rawget, print
+local type, pairs, next, tostring, pcall, require, setmetatable, getmetatable, rawget, print =
+	type, pairs, next, tostring, pcall, require, setmetatable, getmetatable, rawget, print
 local lower, concat = string.lower, table.concat
 
 -- JSON backend: lua-cjson preferred, dkjson fallback. Replaceable via _M.json.
@@ -20,11 +21,9 @@ local function load_json()
 end
 _M.json = load_json()
 
-_M.verbose = false -- when true, prints method/url and payload (may expose secrets)
-
 local function is_https(url) return lower(url:sub(1, 8)) == "https://" end
 
-_M.TIMEOUT = 30 -- default request timeout in seconds (client opt.timeout / per-call override)
+_M.TIMEOUT = 15 -- default request timeout in seconds (client opt.timeout / per-call override)
 
 -- Transports are loaded lazily so plain-HTTP users do not need luasec.
 local http_mod, https_mod, ltn12
@@ -60,15 +59,12 @@ local function copy(t, into)
 	return into
 end
 
--- Pass as the id argument, or call :notify, to omit id. A request with no id is a notification.
-local NOTIFY = {}
-_M.notification = NOTIFY
 
-local reserved_member = { jsonrpc = true, method = true, params = true, id = true }
+local request_reserved = { jsonrpc = true, method = true, params = true, id = true }
+local response_reserved = { jsonrpc = true, result = true, error = true, id = true }
 
-local function is_integer(n)
-	return type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge and n % 1 == 0
-end
+-- n % 1 rejects NaN and inf: those results are not 0.
+local function is_integer(n) return type(n) == "number" and n % 1 == 0 end
 
 local function is_json_null(v)
 	local n = _M.json.null
@@ -76,13 +72,10 @@ local function is_json_null(v)
 end
 
 local function has_array_mt(t)
-	if type(t) ~= "table" then return false end
 	local mt = getmetatable(t)
 	if mt == nil then return false end
 	local j = _M.json
-	if j.empty_array_mt ~= nil and mt == j.empty_array_mt then return true end
-	if j.array_mt ~= nil and mt == j.array_mt then return true end
-	return false
+	return mt == j.empty_array_mt or mt == j.array_mt
 end
 
 -- "array", "sparse", "object", "empty", or "bad" (mixed or non-JSON keys).
@@ -90,7 +83,7 @@ local function classify(t)
 	local maxk, count, has_string = 0, 0, false
 	for k in pairs(t) do
 		count = count + 1
-		if type(k) == "number" and k >= 1 and is_integer(k) then
+		if type(k) == "number" and k >= 1 and k % 1 == 0 then
 			if k > maxk then maxk = k end
 		elseif type(k) == "string" then
 			has_string = true
@@ -98,35 +91,25 @@ local function classify(t)
 			return "bad"
 		end
 	end
-	if has_string and maxk > 0 then return "bad" end
-	if count == 0 then
-		if has_array_mt(t) then return "array" end
-		return "empty"
-	end
-	if has_string then return "object" end
-	if maxk ~= count then return "sparse" end
-	return "array"
+	if has_string then return maxk > 0 and "bad" or "object" end
+	if count == 0 then return has_array_mt(t) and "array" or "empty" end
+	return maxk == count and "array" or "sparse"
 end
 
-local function copy_params(t)
-	local out = copy(t)
-	if has_array_mt(t) then setmetatable(out, getmetatable(t)) end
-	return out
-end
-
--- Returns the params value (nil means omit the member) and an error string.
--- Named client params merge only into an object. An empty Lua table is omitted,
--- because Lua cannot tell {} from []. Pass json.empty_array to send [].
+-- nil omits params. {} is omitted: Lua cannot tell it from []. json.empty_array sends [].
+-- Named client params merge only into an object. The caller's table is not modified.
+-- It is reused as-is unless a merge needs a new table.
 local function build_params(user_params, injected)
 	if injected ~= nil and type(injected) ~= "table" then
 		return nil, "jsonreq: client params must be a table"
 	end
-	injected = injected or {}
+	local injecting = injected ~= nil and next(injected) ~= nil
 	local empty_array = _M.json.empty_array
 	if user_params == nil then
+		if not injecting then return nil end
 		user_params = {}
 	elseif empty_array ~= nil and user_params == empty_array then
-		if next(injected) ~= nil then
+		if injecting then
 			return nil, "jsonreq: cannot inject named params into positional params"
 		end
 		return empty_array
@@ -139,13 +122,17 @@ local function build_params(user_params, injected)
 		return nil, "jsonreq: params must be an array or an object"
 	end
 	if kind == "array" or kind == "sparse" then
-		if next(injected) ~= nil then
+		if injecting then
 			return nil, "jsonreq: cannot inject named params into positional params"
 		end
-		return copy_params(user_params)
+		return user_params
+	end
+	if not injecting then
+		if kind == "empty" then return nil end
+		return user_params
 	end
 
-	local out = copy_params(user_params)
+	local out = copy(user_params)
 	copy(injected, out)
 	kind = classify(out)
 	if kind == "bad" then
@@ -155,20 +142,22 @@ local function build_params(user_params, injected)
 	return out
 end
 
--- Returns sent_id, omit_id, err. omit_id is true for a notification.
+local function accept_id(id)
+	if is_integer(id) or type(id) == "string" or is_json_null(id) then return id end
+	if type(id) == "number" then return nil, "jsonreq: id number must be an integer" end
+	return nil, "jsonreq: id must be a string, integer, or null"
+end
+
+-- Returns sent_id, omit_id, err. false omits id (notification). nil allocates one.
 local function resolve_id(self, id)
 	if id == nil then
 		self.next_id = (self.next_id or 0) + 1
-		return self.next_id, false
+		return self.next_id
 	end
-	if id == false or id == NOTIFY then return nil, true end
-	if is_json_null(id) or type(id) == "string" or is_integer(id) then
-		return id, false
-	end
-	if type(id) == "number" then
-		return nil, false, "jsonreq: id number must be an integer"
-	end
-	return nil, false, "jsonreq: id must be a string, integer, or null"
+	if id == false then return nil, true end
+	local sent, err = accept_id(id)
+	if err then return nil, false, err end
+	return sent
 end
 
 local function ids_equal(a, b)
@@ -178,7 +167,7 @@ local function ids_equal(a, b)
 	return type(a) == type(b) and a == b
 end
 
-local function response_is_array(t)
+local function is_array(t)
 	if type(t) ~= "table" or #t == 0 then return false end
 	for k in pairs(t) do
 		if type(k) ~= "number" then return false end
@@ -188,8 +177,9 @@ end
 
 -- Error string, or nil. A JSON null placeholder for the unused result or error
 -- member is one outcome. A real result next to a real error is not.
+-- sent_id can be omitted to validate a table being send for construction
 local function validate_response(resp, sent_id)
-	if type(resp) ~= "table" or response_is_array(resp) then
+	if type(resp) ~= "table" or is_array(resp) then
 		return "jsonreq: response must be an object"
 	end
 	if resp.jsonrpc ~= "2.0" then
@@ -198,7 +188,7 @@ local function validate_response(resp, sent_id)
 	if resp.id == nil then
 		return "jsonreq: response missing id"
 	end
-	if not ids_equal(resp.id, sent_id) then
+	if sent_id and not ids_equal(resp.id, sent_id) then
 		return "jsonreq: response id does not match request"
 	end
 	local result_set = resp.result ~= nil and not is_json_null(resp.result)
@@ -218,6 +208,27 @@ local function validate_response(resp, sent_id)
 	if resp.result == nil then
 		return "jsonreq: response missing result"
 	end
+end
+
+-- nil is an unknown request id, sent as JSON null. Does not allocate client ids.
+local function rpc_id(id)
+	if id ~= nil then return accept_id(id) end
+	local null = _M.json.null
+	if null == nil then return nil, "jsonreq: id must be a string, integer, or null" end
+	return null
+end
+
+-- One pass. A rejected root leaves tbl partial; the caller discards it.
+local function attach_root(tbl, root, reserved)
+	if root == nil then return tbl end
+	if type(root) ~= "table" then return nil, "jsonreq: root must be a table" end
+	for k, v in pairs(root) do
+		if reserved[k] then
+			return nil, "jsonreq: root cannot override '" .. k .. "'"
+		end
+		tbl[k] = v
+	end
+	return tbl
 end
 
 local function pack_proxy_args(proxy, ...)
@@ -247,6 +258,11 @@ local function safe_encode(v)
 	local ok, res = pcall(_M.json.encode, v)
 	if not ok then return nil, "json encode error: " .. tostring(res) end
 	return res
+end
+
+local function encode_tbl(tbl, err)
+	if not tbl then return nil, err end
+	return safe_encode(tbl)
 end
 
 _M.meta = { methods = {} }
@@ -291,21 +307,21 @@ _M.new = function(opt)
 
 	local tbl = {
 		enabled = opt.enabled ~= false,
-		params = copy(opt.params), -- injected params (for jsonrpc)
-		root = copy(opt.root),     -- injected root table items
+		params = opt.params or {}, -- injected params (for jsonrpc)
+		root = opt.root or {},     -- injected root table items
 		url = opt.url,             -- base url/uri
-		headers = copy(opt.headers), -- injected headers on calls (for auth, etc)
+		headers = opt.headers or {}, -- injected headers on calls (for auth, etc)
 		request_handler = opt.request_handler or request_handler_http,
-		timeout = opt.timeout,     -- seconds; nil -> jsonreq.TIMEOUT (30)
+		timeout = opt.timeout,     -- seconds; nil -> jsonreq.TIMEOUT
 		transport = opt.transport, -- optional function(rtbl) -> res, code, headers (luasocket style)
 		next_id = 0,
 	}
 	local obj = setmetatable(tbl, _M.meta)
-	-- obj.proxy.method(a, b) -> obj:rpc("method", {a, b})
+	-- obj.proxy.method(a, b) -> obj:request("method", {a, b})
 	-- A nil argument is sent as JSON null. Colon calls drop the proxy receiver.
 	tbl.proxy = setmetatable({}, {
 		__index = function(proxy, key)
-			return function(...) return obj:rpc(key, pack_proxy_args(proxy, ...)) end
+			return function(...) return obj:request(key, pack_proxy_args(proxy, ...)) end
 		end,
 		-- backward compat: obj:proxy() returns the proxy table
 		__call = function(self) return self end,
@@ -313,82 +329,136 @@ _M.new = function(opt)
 	return obj
 end
 
--- Build per-call headers: instance defaults < per-call headers; content-type
--- only set if the caller did not provide one (case-insensitive).
+-- Instance headers, then per-call headers. content-type and content-length are
+-- lowercase. ctype replaces a caller content-type. content-length is the body size.
 local function build_headers(self, headers, ctype, len)
 	local h = copy(self.headers)
 	if type(headers) == "table" then copy(headers, h) end
-	local has_ct = false
-	for k in pairs(h) do
-		local lk = type(k) == "string" and lower(k)
-		if lk == "content-length" then h[k] = nil
-		elseif lk == "content-type" then has_ct = true end
+	local ct
+	local drop
+	for k, v in pairs(h) do
+		if type(k) == "string" then
+			local lk = lower(k)
+			if lk == "content-type" then
+				ct = v
+				if k ~= lk then
+					drop = drop or {}
+					drop[#drop + 1] = k
+				end
+			elseif lk == "content-length" and k ~= lk then
+				drop = drop or {}
+				drop[#drop + 1] = k
+			end
+		end
 	end
-	if not has_ct then h["content-type"] = ctype end
+	if drop then
+		for i = 1, #drop do h[drop[i]] = nil end
+	end
+	h["content-type"] = ctype or ct
 	h["content-length"] = tostring(len)
 	return h
 end
 
-function mm:rpc_table(method, params, id)
+local function post_json(self, payload, headers, resource, timeout)
+	return self.request_handler(self, payload,
+		build_headers(self, headers, "application/json", #payload),
+		resource or "", "POST", timeout)
+end
+
+-- bind validate_reponse to the method structure
+mm.validate_response = function(self, t) return validate_response(t) end
+
+function mm:request_table(method, params, id)
 	if type(method) ~= "string" then
 		return nil, "jsonreq: method must be a string"
 	end
 	local params_value, perr = build_params(params, self.params)
 	if perr then return nil, perr end
-	if self.root ~= nil and type(self.root) ~= "table" then
-		return nil, "jsonreq: root must be a table"
-	end
-	if self.root then
-		for k in pairs(self.root) do
-			if reserved_member[k] then
-				return nil, "jsonreq: root cannot override '" .. tostring(k) .. "'"
-			end
-		end
-	end
+	-- Root is checked before resolve_id so a rejection does not consume an id.
+	local tbl = { jsonrpc = "2.0", method = method }
+	if params_value ~= nil then tbl.params = params_value end
+	tbl, perr = attach_root(tbl, self.root, request_reserved)
+	if not tbl then return nil, perr end
 	local sent_id, omit, ierr = resolve_id(self, id)
 	if ierr then return nil, ierr end
-
-	local rpc_tbl = { jsonrpc = "2.0", method = method }
-	if params_value ~= nil then rpc_tbl.params = params_value end
-	if not omit then rpc_tbl.id = sent_id end
-	if self.root then
-		for k, v in pairs(self.root) do rpc_tbl[k] = v end
-	end
-	return rpc_tbl
+	if not omit then tbl.id = sent_id end
+	return tbl
 end
 
-function mm:rpc_string(method, params, id)
-	local rpc_tbl, err = self:rpc_table(method, params, id)
-	if not rpc_tbl then return nil, err end
-	return safe_encode(rpc_tbl)
+function mm:request_string(method, params, id)
+	return encode_tbl(self:request_table(method, params, id))
 end
 
-function mm:rpc(method, params, id, headers, resource, timeout)
+function mm:request(method, params, id, headers, resource, timeout)
 	if not self.enabled then return nil, "disabled" end
-	local rpc_tbl, err = self:rpc_table(method, params, id)
-	if not rpc_tbl then return nil, err end
-	local payload, eerr = safe_encode(rpc_tbl)
+	local request_tbl, err = self:request_table(method, params, id)
+	if not request_tbl then return nil, err end
+	local payload, eerr = safe_encode(request_tbl)
 	if not payload then return nil, eerr end
-	local h = build_headers(self, headers, "application/json", #payload)
-	local body, code, rheaders, raw, derr = self.request_handler(
-		self, payload, h, resource or "", "POST", timeout)
+	local body, code, rheaders, raw, derr = post_json(self, payload, headers, resource, timeout)
 	-- Transport failure keeps nil, message. A notification does not require a body.
 	if type(code) ~= "number" or derr then
 		return body, code, rheaders, raw, derr
 	end
-	if rpc_tbl.id == nil then
+	if request_tbl.id == nil then
 		return body, code, rheaders, raw
 	end
 	if body == nil then
 		return nil, code, rheaders, raw, "jsonreq: empty response"
 	end
-	local verr = validate_response(body, rpc_tbl.id)
+	local verr = validate_response(body, request_tbl.id)
 	if verr then return nil, code, rheaders, raw, verr end
 	return body, code, rheaders, raw
 end
+-- ease and naming shortcuts
+mm.rpc = mm.request
+mm.rpc_table = mm.request_table
+mm.rpc_string = mm.request_string
 
 function mm:notify(method, params, headers, resource, timeout)
-	return self:rpc(method, params, NOTIFY, headers, resource, timeout)
+	return self:request(method, params, false, headers, resource, timeout)
+end
+
+function mm:response_table(result, id)
+	local sent_id, ierr = rpc_id(id)
+	if ierr then return nil, ierr end
+	if result == nil then
+		result = _M.json.null
+		if result == nil then return nil, "jsonreq: JSON null is not available" end
+	end
+	return attach_root({ jsonrpc = "2.0", result = result, id = sent_id }, self.root, response_reserved)
+end
+
+function mm:response_string(result, id)
+	return encode_tbl(self:response_table(result, id))
+end
+
+function mm:response(result, id, headers, resource, timeout)
+	if not self.enabled then return nil, "disabled" end
+	local payload, err = self:response_string(result, id)
+	if not payload then return nil, err end
+	return post_json(self, payload, headers, resource, timeout)
+end
+
+function mm:error_table(code, message, id, data)
+	if not is_integer(code) then return nil, "jsonreq: error.code must be an integer" end
+	if type(message) ~= "string" then return nil, "jsonreq: error.message must be a string" end
+	local sent_id, ierr = rpc_id(id)
+	if ierr then return nil, ierr end
+	local err_obj = { code = code, message = message }
+	if data ~= nil then err_obj.data = data end
+	return attach_root({ jsonrpc = "2.0", error = err_obj, id = sent_id }, self.root, response_reserved)
+end
+
+function mm:error_string(code, message, id, data)
+	return encode_tbl(self:error_table(code, message, id, data))
+end
+
+function mm:error(code, message, id, data, headers, resource, timeout)
+	if not self.enabled then return nil, "disabled" end
+	local payload, err = self:error_string(code, message, id, data)
+	if not payload then return nil, err end
+	return post_json(self, payload, headers, resource, timeout)
 end
 
 function mm:call(payload, headers, resource, method, timeout)
