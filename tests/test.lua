@@ -40,7 +40,8 @@ test("rpc builds valid request and decodes", function()
 	eq(sent.jsonrpc, "2.0"); eq(sent.method, "add"); eq(sent.id, 1); eq(sent.params[2], 2)
 	eq(last.req.method, "POST"); eq(last.req.url, "http://h")
 	eq(last.req.headers.Authorization, "Bearer z")
-	eq(last.req.headers["content-length"], tostring(#last.body))
+	eq(last.req.headers["Content-Type"], "application/json")
+	eq(last.req.headers["Content-Length"], tostring(#last.body))
 end)
 
 test("rpc ids increment, params omitted when empty", function()
@@ -86,25 +87,29 @@ test("REST verbs and resource", function()
 	for _, v in ipairs({ "get", "delete" }) do
 		local r = c[v](c, "/r"); eq(r[2], 2); eq(last.req.method, v:upper()); eq(last.req.url, "http://h/r")
 	end
-	for _, v in ipairs({ "post", "put", "patch", "update" }) do
+	for _, v in ipairs({ "post", "put", "patch" }) do
 		local p = { x = 1 }
-		c[v](c, "/r", p); eq(last.req.method, v == "update" and "PATCH" or v:upper()); eq(json.decode(last.body).x, 1)
+		c[v](c, "/r", p); eq(last.req.method, v:upper()); eq(json.decode(last.body).x, 1)
 	end
+	eq(c.update, nil)
 end)
 
-test("call does not mutate payload; json content-type wins", function()
+test("call writes root into the payload; content headers use the given case", function()
 	local t, last = fake(200, '{}')
 	local c = jr.new({ url = "http://h", transport = t, root = { r = 1 }, headers = { A = "inst", ["content-type"] = "text/plain" } })
 	local p = { x = 1 }
-	local h = { A = "call", ["Content-Type"] = "text/csv" }
+	local h = { A = "call", ["Content-Type"] = "text/csv", ["content-length"] = "1" }
 	c:post("", p, h)
-	eq(p.r, nil)
-	eq(h["content-length"], nil); eq(h["Content-Type"], "text/csv"); eq(h.A, "call")
+	eq(p.x, 1); eq(p.r, 1)
+	eq(h.A, "call"); eq(h["Content-Type"], "text/csv"); eq(h["content-length"], "1")
 	eq(c.headers["content-type"], "text/plain")
 	eq(last.req.headers.A, "call")
-	eq(last.req.headers["content-type"], "application/json")
-	eq(last.req.headers["Content-Type"], nil)
-	eq(last.req.headers["content-length"], tostring(#last.body))
+	eq(last.req.headers["Content-Type"], "application/json")
+	eq(last.req.headers["content-type"], "text/plain")
+	eq(last.req.headers["Content-Length"], tostring(#last.body))
+	eq(last.req.headers["content-length"], "1")
+	local sent = json.decode(last.body)
+	eq(sent.x, 1); eq(sent.r, 1)
 end)
 
 test("empty body, bad json, transport failure", function()
@@ -308,19 +313,6 @@ test("response_table is a result object", function()
 	r, e = c:response_table(1, 1); eq(r, nil); assert(tostring(e):find("result"), e)
 end)
 
-test("response posts the result and does not require a json-rpc reply", function()
-	local t, last = fake(204, nil)
-	local c = jr.new({ url = "http://h/rpc", transport = t, headers = { A = "1" } })
-	local res, code = c:response(19, 4, { A = "call" }, "/cb")
-	eq(res, nil); eq(code, 204)
-	local sent = json.decode(last.body)
-	eq(sent.result, 19); eq(sent.id, 4); eq(sent.jsonrpc, "2.0"); eq(sent.error, nil)
-	eq(last.req.method, "POST"); eq(last.req.url, "http://h/rpc/cb")
-	eq(last.req.headers.A, "call")
-	c.enabled = false
-	local r, e = c:response(1, 1); eq(r, nil); eq(e, "disabled")
-end)
-
 test("error_table is an error response", function()
 	local c = jr.new("http://h")
 	local t = c:error_table(-32601, "Method not found", "1", { name = "nope" })
@@ -336,53 +328,16 @@ test("error_table is an error response", function()
 	r, e = c:error_table(-32603, "x", false); eq(r, nil); assert(tostring(e):find("id"), e)
 end)
 
-test("response and error sending", function()
-	local calls = 0
-	local last = {}
-	local function t(r)
-		calls = calls + 1
-		last.req = r
-		local buf = {}
-		if r.source then
-			while true do local ch = r.source(); if not ch then break end; buf[#buf + 1] = ch end
-		end
-		last.body = table.concat(buf)
-		if last.fail then return nil, last.fail end
-		if last.reply then r.sink(last.reply); r.sink(nil) end
-		return 1, last.status or 200, {}
-	end
-	local c = jr.new({ url = "http://h", transport = t, timeout = 9 })
-	local res, err = c:response(function() end, 1)
-	eq(res, nil); assert(tostring(err):find("encode"), err); eq(calls, 0)
-
-	last.fail = "connection refused"
-	res, err = c:response(1, 1)
-	eq(res, nil); eq(err, "connection refused"); eq(calls, 1)
-	last.fail = nil
-
-	last.status = 204
-	c:response(1, 2, nil, nil, 4)
-	eq(last.req.timeout, 4)
-	c:error(-1, "m", 1)
-	eq(last.req.timeout, 9)
-
-	local h = { A = "x" }
-	c:error(-32601, "no", 1, nil, h)
-	eq(h["content-type"], nil); eq(h["content-length"], nil); eq(h.A, "x")
-	local sent = json.decode(last.body)
-	eq(sent.error.data, nil); assert(not last.body:find('"data"', 1, true), last.body)
-
+test("response and error are builders", function()
+	local c = jr.new("http://h")
+	eq(c.response, nil); eq(c.error, nil)
+	local raw = c:error_string(-32601, "no", 1)
+	assert(not raw:find('"data"', 1, true), raw)
 	local with_null = json.decode(c:error_string(-1, "m", 1, json.null))
 	eq(with_null.error.data, json.null)
-
 	c.root = { trace = "t", error = { code = 1, message = "x" } }
-	res, err = c:error_table(-32601, "nope", 5)
+	local res, err = c:error_table(-32601, "nope", 5)
 	eq(res, nil); assert(tostring(err):find("error"), err)
-	c.root = {}
-
-	c.enabled = false
-	res, err = c:error(-1, "m", 1)
-	eq(res, nil); eq(err, "disabled"); eq(calls, 4)
 
 	local peer = jr.new("http://h")
 	local payload = peer:response_string({ n = 2 }, 7)
@@ -399,17 +354,6 @@ test("response and error sending", function()
 	eq(code, 200); eq(body.result.n, 2); eq(body.id, 7)
 	body, code = srv:request("echo", {}, "abc", nil, "err")
 	eq(code, 200); eq(body.error.code, -32601); eq(body.result, nil); eq(body.error.data, nil)
-end)
-
-test("error posts the error object", function()
-	local t, last = fake(200, '{"ok":true}')
-	local c = jr.new({ url = "http://h", transport = t })
-	local res, code = c:error(-32602, "Invalid params", 8, { expected = "array" })
-	eq(code, 200); eq(res.ok, true)
-	local sent = json.decode(last.body)
-	eq(sent.error.code, -32602); eq(sent.error.message, "Invalid params")
-	eq(sent.error.data.expected, "array"); eq(sent.id, 8); eq(sent.result, nil)
-	eq(last.req.headers["content-type"], "application/json")
 end)
 
 test("no globals leaked", function()

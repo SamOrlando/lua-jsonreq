@@ -1,7 +1,7 @@
 --- jsonreq: JSON over HTTP(S) requests and JSON-RPC 2.0 client helpers.
 -- Works on Lua 5.1, 5.2, 5.3, 5.4 and LuaJIT.
 local _M = {
-	_VERSION     = 'json-request 0.2.1',
+	_VERSION     = 'json-request 0.2.2',
 	_DESCRIPTION = 'JSON-Request (jsonreq) : handles general JSON HTTP/anything request with headers and JSONRPC functions.',
 	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2026',
 	verbose = false -- when true, prints method/url and payload (may expose secrets)
@@ -329,33 +329,13 @@ _M.new = function(opt)
 	return obj
 end
 
--- Instance headers, then per-call headers. content-type and content-length are
--- lowercase. ctype replaces a caller content-type. content-length is the body size.
+-- Instance headers, then per-call headers. Content-Type and Content-Length are
+-- set from ctype and len. Other spellings are left as given.
 local function build_headers(self, headers, ctype, len)
 	local h = copy(self.headers)
 	if type(headers) == "table" then copy(headers, h) end
-	local ct
-	local drop
-	for k, v in pairs(h) do
-		if type(k) == "string" then
-			local lk = lower(k)
-			if lk == "content-type" then
-				ct = v
-				if k ~= lk then
-					drop = drop or {}
-					drop[#drop + 1] = k
-				end
-			elseif lk == "content-length" and k ~= lk then
-				drop = drop or {}
-				drop[#drop + 1] = k
-			end
-		end
-	end
-	if drop then
-		for i = 1, #drop do h[drop[i]] = nil end
-	end
-	h["content-type"] = ctype or ct
-	h["content-length"] = tostring(len)
+	h["Content-Type"] = ctype and ctype
+	h["Content-Length"] = len and tostring(len)
 	return h
 end
 
@@ -365,7 +345,6 @@ local function post_json(self, payload, headers, resource, timeout)
 		resource or "", "POST", timeout)
 end
 
--- bind validate_reponse to the method structure
 mm.validate_response = function(self, t) return validate_response(t) end
 
 function mm:request_table(method, params, id)
@@ -433,13 +412,6 @@ function mm:response_string(result, id)
 	return encode_tbl(self:response_table(result, id))
 end
 
-function mm:response(result, id, headers, resource, timeout)
-	if not self.enabled then return nil, "disabled" end
-	local payload, err = self:response_string(result, id)
-	if not payload then return nil, err end
-	return post_json(self, payload, headers, resource, timeout)
-end
-
 function mm:error_table(code, message, id, data)
 	if not is_integer(code) then return nil, "jsonreq: error.code must be an integer" end
 	if type(message) ~= "string" then return nil, "jsonreq: error.message must be a string" end
@@ -454,17 +426,10 @@ function mm:error_string(code, message, id, data)
 	return encode_tbl(self:error_table(code, message, id, data))
 end
 
-function mm:error(code, message, id, data, headers, resource, timeout)
-	if not self.enabled then return nil, "disabled" end
-	local payload, err = self:error_string(code, message, id, data)
-	if not payload then return nil, err end
-	return post_json(self, payload, headers, resource, timeout)
-end
-
 function mm:call(payload, headers, resource, method, timeout)
 	if not self.enabled then return nil, "disabled" end
 	if type(payload) == "table" then
-		payload = copy(self.root, copy(payload))
+		payload = copy(self.root, payload)
 	end
 	if payload ~= nil and type(payload) ~= "string" then
 		local err
@@ -480,7 +445,6 @@ function mm:get(resource, headers, timeout) return self:call(nil, headers, resou
 function mm:post(resource, payload, headers, timeout) return self:call(payload, headers, resource, "POST", timeout) end
 function mm:put(resource, payload, headers, timeout) return self:call(payload, headers, resource, "PUT", timeout) end
 function mm:patch(resource, payload, headers, timeout) return self:call(payload, headers, resource, "PATCH", timeout) end
-mm.update = mm.patch -- legacy name; UPDATE is not an HTTP method, sends PATCH (RFC 5789)
 function mm:delete(resource, headers, timeout) return self:call(nil, headers, resource, "DELETE", timeout) end
 
 return _M
