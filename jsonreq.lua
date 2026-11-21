@@ -226,7 +226,7 @@ local function attach_root(tbl, root, reserved)
 		if reserved[k] then
 			return nil, "jsonreq: root cannot override '" .. k .. "'"
 		end
-		tbl[k] = not tbl[k] and v
+		tbl[k] = tbl[k] == nil and v
 	end
 	return tbl
 end
